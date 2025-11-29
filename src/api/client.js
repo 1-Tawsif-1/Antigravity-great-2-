@@ -2,7 +2,7 @@ import tokenManager from '../auth/token_manager.js';
 import config from '../config/config.js';
 import logger from '../utils/logger.js';
 
-async function tryRequest(token, url, requestBody) {
+async function tryRequestWithToken(token, url, requestBody) {
   const response = await fetch(url, {
     method: 'POST',
     headers: {
@@ -26,132 +26,147 @@ async function tryRequest(token, url, requestBody) {
   return response;
 }
 
-export async function generateAssistantResponse(requestBody, callback) {
-  const totalTokens = tokenManager.tokens.length || 3;
-  let lastError = null;
-  
-  // Try all available tokens before giving up
-  for (let attempt = 0; attempt < totalTokens; attempt++) {
-    const token = await tokenManager.getToken();
+async function processStreamResponse(response, callback) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let thinkingStarted = false;
+  let toolCalls = [];
 
-    if (!token) {
-      throw new Error('没有可用的token，请运行 npm run login 获取token');
-    }
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
 
-    const url = config.api.url;
-    const source = token._source || 'file';
+    const chunk = decoder.decode(value);
+    const lines = chunk.split('\n').filter(line => line.startsWith('data: '));
 
-    try {
-      const response = await tryRequest(token, url, requestBody);
-      
-      // Success - process the response
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let thinkingStarted = false;
-      let toolCalls = [];
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        const chunk = decoder.decode(value);
-        const lines = chunk.split('\n').filter(line => line.startsWith('data: '));
-
-        for (const line of lines) {
-          const jsonStr = line.slice(6);
-          try {
-            const data = JSON.parse(jsonStr);
-            const parts = data.response?.candidates?.[0]?.content?.parts;
-            if (parts) {
-              for (const part of parts) {
-                if (part.thought === true) {
-                  if (!thinkingStarted) {
-                    callback({ type: 'thinking', content: '<think>\n' });
-                    thinkingStarted = true;
-                  }
-                  callback({ type: 'thinking', content: part.text || '' });
-                } else if (part.text !== undefined) {
-                  if (thinkingStarted) {
-                    callback({ type: 'thinking', content: '\n</think>\n' });
-                    thinkingStarted = false;
-                  }
-                  let content = part.text || '';
-                  if (part.thought_signature) {
-                    content += `\n<!-- thought_signature: ${part.thought_signature} -->`;
-                  }
-
-                  if (part.inlineData) {
-                    const mimeType = part.inlineData.mimeType;
-                    const data = part.inlineData.data;
-                    content += `\n![Generated Image](data:${mimeType};base64,${data})`;
-                  }
-
-                  if (content) {
-                    callback({ type: 'text', content: content });
-                  }
-                } else if (part.functionCall) {
-                  toolCalls.push({
-                    id: part.functionCall.id,
-                    type: 'function',
-                    function: {
-                      name: part.functionCall.name,
-                      arguments: JSON.stringify(part.functionCall.args)
-                    }
-                  });
-                }
+    for (const line of lines) {
+      const jsonStr = line.slice(6);
+      try {
+        const data = JSON.parse(jsonStr);
+        const parts = data.response?.candidates?.[0]?.content?.parts;
+        if (parts) {
+          for (const part of parts) {
+            if (part.thought === true) {
+              if (!thinkingStarted) {
+                callback({ type: 'thinking', content: '<think>\n' });
+                thinkingStarted = true;
               }
-            }
-
-            if (data.response?.candidates?.[0]?.finishReason && toolCalls.length > 0) {
+              callback({ type: 'thinking', content: part.text || '' });
+            } else if (part.text !== undefined) {
               if (thinkingStarted) {
                 callback({ type: 'thinking', content: '\n</think>\n' });
                 thinkingStarted = false;
               }
-              callback({ type: 'tool_calls', tool_calls: toolCalls });
-              toolCalls = [];
+              let content = part.text || '';
+              if (part.thought_signature) {
+                content += `\n<!-- thought_signature: ${part.thought_signature} -->`;
+              }
+
+              if (part.inlineData) {
+                const mimeType = part.inlineData.mimeType;
+                const data = part.inlineData.data;
+                content += `\n![Generated Image](data:${mimeType};base64,${data})`;
+              }
+
+              if (content) {
+                callback({ type: 'text', content: content });
+              }
+            } else if (part.functionCall) {
+              toolCalls.push({
+                id: part.functionCall.id,
+                type: 'function',
+                function: {
+                  name: part.functionCall.name,
+                  arguments: JSON.stringify(part.functionCall.args)
+                }
+              });
             }
-          } catch (e) {
-            // Ignore parse errors
           }
         }
+
+        if (data.response?.candidates?.[0]?.finishReason && toolCalls.length > 0) {
+          if (thinkingStarted) {
+            callback({ type: 'thinking', content: '\n</think>\n' });
+            thinkingStarted = false;
+          }
+          callback({ type: 'tool_calls', tool_calls: toolCalls });
+          toolCalls = [];
+        }
+      } catch (e) {
+        // Ignore parse errors
       }
+    }
+  }
+}
+
+export async function generateAssistantResponse(requestBody, callback) {
+  const totalTokens = tokenManager.getTokenCount();
+  
+  if (totalTokens === 0) {
+    throw new Error('没有可用的token，请运行 npm run login 获取token');
+  }
+
+  const url = config.api.url;
+  let lastError = null;
+  const triedIndices = new Set();
+  
+  // Try ALL tokens explicitly by index
+  for (let attempt = 0; attempt < totalTokens; attempt++) {
+    // Get token by specific index to ensure we try each one
+    const tokenIndex = attempt;
+    
+    if (triedIndices.has(tokenIndex)) continue;
+    triedIndices.add(tokenIndex);
+    
+    const token = await tokenManager.getTokenByIndex(tokenIndex);
+    
+    if (!token) continue;
+
+    const source = token._source || 'file';
+
+    try {
+      const response = await tryRequestWithToken(token, url, requestBody);
       
-      // Success - return without error
-      return;
+      // Success - process the response
+      await processStreamResponse(response, callback);
+      return; // Success - exit
       
     } catch (error) {
       lastError = error;
       
-      if (error.isRetryable && attempt < totalTokens - 1) {
-        logger.warn(`Token (来源: ${source}) 请求失败 (${error.status})，尝试下一个token (${attempt + 1}/${totalTokens})`);
-        // Continue to next token
-        continue;
+      if (error.isRetryable) {
+        logger.warn(`Token #${tokenIndex} (来源: ${source}) 失败 (${error.status})，静默尝试下一个 (${attempt + 1}/${totalTokens})`);
+        continue; // Try next token silently
       }
       
-      // Not retryable or last attempt - will throw after loop
-      if (!error.isRetryable) {
-        throw error;
-      }
+      // Non-retryable error - but still try other tokens
+      logger.warn(`Token #${tokenIndex} 非重试错误: ${error.message}`);
+      continue;
     }
   }
 
-  // All tokens exhausted
+  // ALL tokens exhausted - now show error
   if (lastError) {
-    logger.error('所有token都已尝试，全部失败');
+    logger.error(`所有 ${totalTokens} 个token都已尝试，全部失败`);
     throw lastError;
   }
+  
+  throw new Error('所有token都已尝试，请稍后重试');
 }
 
 export async function getAvailableModels() {
-  const totalTokens = tokenManager.tokens.length || 3;
+  const totalTokens = tokenManager.getTokenCount();
+  
+  if (totalTokens === 0) {
+    throw new Error('没有可用的token，请运行 npm run login 获取token');
+  }
+  
   let lastError = null;
   
   for (let attempt = 0; attempt < totalTokens; attempt++) {
-    const token = await tokenManager.getToken();
-
-    if (!token) {
-      throw new Error('没有可用的token，请运行 npm run login 获取token');
-    }
+    const token = await tokenManager.getTokenByIndex(attempt);
+    
+    if (!token) continue;
 
     try {
       const response = await fetch(config.api.modelsUrl, {
@@ -195,13 +210,9 @@ export async function getAvailableModels() {
     } catch (error) {
       lastError = error;
       
-      if (error.isRetryable && attempt < totalTokens - 1) {
-        logger.warn(`获取模型列表失败，尝试下一个token (${attempt + 1}/${totalTokens})`);
+      if (error.isRetryable) {
+        logger.warn(`获取模型列表: Token #${attempt} 失败，尝试下一个`);
         continue;
-      }
-      
-      if (!error.isRetryable) {
-        throw error;
       }
     }
   }
@@ -209,4 +220,6 @@ export async function getAvailableModels() {
   if (lastError) {
     throw lastError;
   }
+  
+  throw new Error('获取模型列表失败');
 }

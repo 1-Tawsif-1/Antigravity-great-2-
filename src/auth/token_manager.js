@@ -249,6 +249,39 @@ class TokenManager {
       tokens: stats
     };
   }
+
+  // Get total number of tokens
+  getTokenCount() {
+    this.loadTokens();
+    return this.tokens.length;
+  }
+
+  // Get token by specific index (for retry logic)
+  async getTokenByIndex(index) {
+    this.loadTokens();
+    
+    if (this.tokens.length === 0 || index >= this.tokens.length) {
+      return null;
+    }
+
+    const token = this.tokens[index];
+    const source = token._source || 'file';
+
+    try {
+      if (this.isExpired(token)) {
+        await this.refreshToken(token);
+      }
+      
+      this.recordUsage(token);
+      log.info(`🔄 使用 Token #${index} (来源: ${source}) (总请求: ${this.getTokenRequests(token)})`);
+
+      return token;
+    } catch (error) {
+      log.warn(`Token #${index} 刷新失败: ${error.message}`);
+      // Return the token anyway, let API call handle it
+      return token;
+    }
+  }
 }
 
 const tokenManager = new TokenManager();
