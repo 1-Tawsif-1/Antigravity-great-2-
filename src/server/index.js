@@ -30,6 +30,42 @@ ensureDirectories();
 
 const app = express();
 
+// Track uptime statistics
+let uptimeStats = {
+  startTime: Date.now(),
+  pingCount: 0,
+  lastPing: null
+};
+
+// Health check endpoint for UptimeRobot (no auth required)
+app.get('/health', (req, res) => {
+  uptimeStats.pingCount++;
+  uptimeStats.lastPing = new Date().toISOString();
+  
+  const uptime = Math.floor((Date.now() - uptimeStats.startTime) / 1000);
+  const hours = Math.floor(uptime / 3600);
+  const minutes = Math.floor((uptime % 3600) / 60);
+  const seconds = uptime % 60;
+  
+  logger.info(`[UptimeRobot] Health check ping #${uptimeStats.pingCount} | Uptime: ${hours}h ${minutes}m ${seconds}s`);
+  
+  res.json({
+    status: 'ok',
+    timestamp: uptimeStats.lastPing,
+    uptime: `${hours}h ${minutes}m ${seconds}s`,
+    pingCount: uptimeStats.pingCount,
+    service: 'Antigravity Gateway'
+  });
+});
+
+// Alias endpoints for flexibility
+app.get('/ping', (req, res) => {
+  uptimeStats.pingCount++;
+  uptimeStats.lastPing = new Date().toISOString();
+  logger.info(`[UptimeRobot] Ping #${uptimeStats.pingCount} received`);
+  res.send('pong');
+});
+
 app.use(express.json({ limit: config.security.maxRequestSize }));
 
 // 静态文件服务 - 提供管理控制台页面
