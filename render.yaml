@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: antigravity-gateway
+    runtime: node
+    region: oregon
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /v1/models
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: API_KEY
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: ACCOUNTS_JSON
+        sync: false

@@ -4,6 +4,7 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { generateAssistantResponse, getAvailableModels } from '../api/client.js';
 import { generateRequestBody } from '../utils/utils.js';
+import { generateAnthropicRequestBody, generateMessageId } from '../utils/anthropic.js';
 import logger from '../utils/logger.js';
 import config from '../config/config.js';
 import adminRoutes, { incrementRequestCount, addLog } from '../admin/routes.js';
@@ -249,6 +250,245 @@ app.post('/v1/chat/completions', async (req, res) => {
       } else {
         res.status(500).json({ error: error.message });
       }
+    }
+  }
+});
+
+// Anthropic API endpoint - /v1/messages
+app.post('/v1/messages', async (req, res) => {
+  let { messages, model, stream = false, max_tokens, system, tools, ...params } = req.body;
+  
+  try {
+    if (!messages) {
+      return res.status(400).json({
+        type: 'error',
+        error: { type: 'invalid_request_error', message: 'messages is required' }
+      });
+    }
+
+    if (!max_tokens) {
+      return res.status(400).json({
+        type: 'error',
+        error: { type: 'invalid_request_error', message: 'max_tokens is required' }
+      });
+    }
+
+    const authHeader = req.headers.authorization || req.headers['x-api-key'];
+    const apiKey = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
+
+    const requestBody = generateAnthropicRequestBody({
+      messages,
+      model,
+      max_tokens,
+      system,
+      tools,
+      ...params
+    }, apiKey);
+
+    const messageId = generateMessageId();
+    let inputTokens = 0;
+    let outputTokens = 0;
+
+    if (stream) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+
+      // Send message_start event
+      res.write(`event: message_start\ndata: ${JSON.stringify({
+        type: 'message_start',
+        message: {
+          id: messageId,
+          type: 'message',
+          role: 'assistant',
+          content: [],
+          model,
+          stop_reason: null,
+          stop_sequence: null,
+          usage: { input_tokens: inputTokens, output_tokens: 1 }
+        }
+      })}\n\n`);
+
+      let contentBlockIndex = 0;
+      let currentBlockType = null;
+      let hasToolUse = false;
+      let thinkingStarted = false;
+      let thinkingBlockIndex = -1;
+      let textBlockIndex = -1;
+
+      await generateAssistantResponse(requestBody, (data) => {
+        if (data.type === 'thinking') {
+          // Handle thinking blocks
+          if (data.content === '<think>\n') {
+            thinkingStarted = true;
+            thinkingBlockIndex = contentBlockIndex;
+            res.write(`event: content_block_start\ndata: ${JSON.stringify({
+              type: 'content_block_start',
+              index: contentBlockIndex,
+              content_block: { type: 'thinking', thinking: '' }
+            })}\n\n`);
+            contentBlockIndex++;
+          } else if (data.content === '\n</think>\n') {
+            if (thinkingStarted && thinkingBlockIndex >= 0) {
+              res.write(`event: content_block_stop\ndata: ${JSON.stringify({
+                type: 'content_block_stop',
+                index: thinkingBlockIndex
+              })}\n\n`);
+            }
+            thinkingStarted = false;
+          } else if (thinkingStarted && data.content) {
+            res.write(`event: content_block_delta\ndata: ${JSON.stringify({
+              type: 'content_block_delta',
+              index: thinkingBlockIndex,
+              delta: { type: 'thinking_delta', thinking: data.content }
+            })}\n\n`);
+            outputTokens += Math.ceil(data.content.length / 4);
+          }
+        } else if (data.type === 'tool_calls') {
+          hasToolUse = true;
+          for (const toolCall of data.tool_calls) {
+            // Start tool_use block
+            res.write(`event: content_block_start\ndata: ${JSON.stringify({
+              type: 'content_block_start',
+              index: contentBlockIndex,
+              content_block: { type: 'tool_use', id: toolCall.id, name: toolCall.function.name, input: {} }
+            })}\n\n`);
+
+            // Send input delta
+            const inputJson = toolCall.function.arguments;
+            res.write(`event: content_block_delta\ndata: ${JSON.stringify({
+              type: 'content_block_delta',
+              index: contentBlockIndex,
+              delta: { type: 'input_json_delta', partial_json: inputJson }
+            })}\n\n`);
+
+            // Stop tool_use block
+            res.write(`event: content_block_stop\ndata: ${JSON.stringify({
+              type: 'content_block_stop',
+              index: contentBlockIndex
+            })}\n\n`);
+
+            contentBlockIndex++;
+            outputTokens += Math.ceil(inputJson.length / 4);
+          }
+        } else if (data.content) {
+          // Start text block if not started
+          if (textBlockIndex < 0) {
+            textBlockIndex = contentBlockIndex;
+            res.write(`event: content_block_start\ndata: ${JSON.stringify({
+              type: 'content_block_start',
+              index: contentBlockIndex,
+              content_block: { type: 'text', text: '' }
+            })}\n\n`);
+            contentBlockIndex++;
+          }
+
+          res.write(`event: content_block_delta\ndata: ${JSON.stringify({
+            type: 'content_block_delta',
+            index: textBlockIndex,
+            delta: { type: 'text_delta', text: data.content }
+          })}\n\n`);
+          outputTokens += Math.ceil(data.content.length / 4);
+        }
+      });
+
+      // Close text block if open
+      if (textBlockIndex >= 0) {
+        res.write(`event: content_block_stop\ndata: ${JSON.stringify({
+          type: 'content_block_stop',
+          index: textBlockIndex
+        })}\n\n`);
+      }
+
+      // Send message_delta with stop_reason
+      res.write(`event: message_delta\ndata: ${JSON.stringify({
+        type: 'message_delta',
+        delta: {
+          stop_reason: hasToolUse ? 'tool_use' : 'end_turn',
+          stop_sequence: null
+        },
+        usage: { output_tokens: outputTokens }
+      })}\n\n`);
+
+      // Send message_stop
+      res.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
+      res.end();
+
+    } else {
+      // Non-streaming response
+      let fullContent = '';
+      let toolCalls = [];
+      let thinkingContent = '';
+      let thinkingStarted = false;
+
+      await generateAssistantResponse(requestBody, (data) => {
+        if (data.type === 'thinking') {
+          if (data.content === '<think>\n') {
+            thinkingStarted = true;
+          } else if (data.content === '\n</think>\n') {
+            thinkingStarted = false;
+          } else if (thinkingStarted) {
+            thinkingContent += data.content;
+          }
+        } else if (data.type === 'tool_calls') {
+          toolCalls = data.tool_calls;
+        } else {
+          fullContent += data.content;
+        }
+      });
+
+      const content = [];
+
+      // Add thinking block if present
+      if (thinkingContent) {
+        content.push({ type: 'thinking', thinking: thinkingContent });
+      }
+
+      // Add text block
+      if (fullContent) {
+        content.push({ type: 'text', text: fullContent });
+      }
+
+      // Add tool_use blocks
+      for (const toolCall of toolCalls) {
+        let parsedInput = {};
+        try {
+          parsedInput = JSON.parse(toolCall.function.arguments);
+        } catch (e) {
+          parsedInput = { query: toolCall.function.arguments };
+        }
+        content.push({
+          type: 'tool_use',
+          id: toolCall.id,
+          name: toolCall.function.name,
+          input: parsedInput
+        });
+      }
+
+      res.json({
+        id: messageId,
+        type: 'message',
+        role: 'assistant',
+        content,
+        model,
+        stop_reason: toolCalls.length > 0 ? 'tool_use' : 'end_turn',
+        stop_sequence: null,
+        usage: {
+          input_tokens: inputTokens,
+          output_tokens: Math.ceil((fullContent.length + thinkingContent.length) / 4)
+        }
+      });
+    }
+  } catch (error) {
+    logger.error('Anthropic API 响应失败:', error.message);
+    if (!res.headersSent) {
+      res.status(500).json({
+        type: 'error',
+        error: {
+          type: 'api_error',
+          message: error.message
+        }
+      });
     }
   }
 });

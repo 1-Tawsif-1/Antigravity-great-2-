@@ -18,6 +18,7 @@ class TokenManager {
     this.loadInterval = 60000; // 1分钟内不重复加载
     this.cachedData = null; // 缓存文件数据，减少磁盘读取
     this.usageStats = new Map(); // Token 使用统计 { refresh_token -> { requests, lastUsed } }
+    this.useEnvAccounts = !!process.env.ACCOUNTS_JSON; // Flag to track if using env var
     this.loadTokens();
   }
 
@@ -29,8 +30,25 @@ class TokenManager {
       }
 
       log.info('正在加载token...');
-      const data = fs.readFileSync(this.filePath, 'utf8');
-      const tokenArray = JSON.parse(data);
+      
+      let tokenArray;
+      
+      // Priority: ACCOUNTS_JSON env var > file
+      if (process.env.ACCOUNTS_JSON) {
+        try {
+          tokenArray = JSON.parse(process.env.ACCOUNTS_JSON);
+          this.useEnvAccounts = true;
+          log.info('从环境变量 ACCOUNTS_JSON 加载token');
+        } catch (parseError) {
+          log.error('解析 ACCOUNTS_JSON 环境变量失败:', parseError.message);
+          tokenArray = [];
+        }
+      } else {
+        const data = fs.readFileSync(this.filePath, 'utf8');
+        tokenArray = JSON.parse(data);
+        this.useEnvAccounts = false;
+      }
+      
       this.cachedData = tokenArray; // 缓存原始数据
       this.tokens = tokenArray.filter(token => token.enable !== false);
       this.currentIndex = 0;
@@ -87,6 +105,12 @@ class TokenManager {
   }
 
   saveToFile() {
+    // Skip saving if using environment variable (can't write to env vars)
+    if (this.useEnvAccounts) {
+      log.info('使用环境变量模式，跳过文件保存（token状态仅在内存中更新）');
+      return;
+    }
+    
     try {
       // 使用缓存数据，减少磁盘读取
       let allTokens = this.cachedData;
