@@ -34,9 +34,22 @@ class TokenManager {
       let tokenArray;
       
       // Priority: ACCOUNTS_JSON env var > file
+      // Supports both raw JSON and Base64-encoded JSON
       if (process.env.ACCOUNTS_JSON) {
         try {
-          tokenArray = JSON.parse(process.env.ACCOUNTS_JSON);
+          let jsonStr = process.env.ACCOUNTS_JSON;
+          
+          // Check if it's Base64 encoded (doesn't start with '[')
+          if (!jsonStr.trim().startsWith('[')) {
+            try {
+              jsonStr = Buffer.from(jsonStr, 'base64').toString('utf8');
+              log.info('从 Base64 编码的 ACCOUNTS_JSON 解码');
+            } catch (decodeError) {
+              // Not base64, try as raw JSON
+            }
+          }
+          
+          tokenArray = JSON.parse(jsonStr);
           this.useEnvAccounts = true;
           log.info('从环境变量 ACCOUNTS_JSON 加载token');
         } catch (parseError) {
