@@ -25,8 +25,15 @@ export async function generateAssistantResponse(requestBody, callback) {
   if (!response.ok) {
     const errorText = await response.text();
     if (response.status === 403) {
-      tokenManager.disableCurrentToken(token);
-      throw new Error(`该账号没有使用权限，已自动禁用。错误详情: ${errorText}`);
+      // Use long cooldown for permission errors (1 hour) instead of permanent disable
+      // This works better with env var mode where we can't persist disabled state
+      tokenManager.setCooldown(token, 60 * 60 * 1000); // 1 hour cooldown
+      throw new Error(`该账号没有使用权限，已进入1小时冷却期。错误详情: ${errorText}`);
+    }
+    if (response.status === 429) {
+      // Rate limit - 10 minute cooldown
+      tokenManager.setCooldown(token, 10 * 60 * 1000);
+      throw new Error(`该账号已达到速率限制，已进入10分钟冷却期。错误详情: ${errorText}`);
     }
     throw new Error(`API请求失败 (${response.status}): ${errorText}`);
   }
