@@ -18,8 +18,41 @@ class TokenManager {
     this.loadInterval = 60000; // 1分钟内不重复加载
     this.cachedData = null; // 缓存文件数据，减少磁盘读取
     this.usageStats = new Map(); // Token 使用统计 { refresh_token -> { requests, lastUsed } }
-    this.useEnvAccounts = !!process.env.ACCOUNTS_JSON; // Flag to track if using env var
+    this.useEnvAccounts = false; // Flag to track if using env var
+    this.tokenCooldowns = new Map(); // Track temporarily disabled tokens { refresh_token -> cooldownUntil }
+    this.cooldownDuration = 5 * 60 * 1000; // 5 minutes cooldown for rate-limited tokens
     this.loadTokens();
+  }
+
+  // Parse a single ACCOUNTS_JSON env var (supports raw JSON and Base64)
+  parseAccountsEnvVar(envVarName) {
+    const envValue = process.env[envVarName];
+    if (!envValue) return [];
+    
+    try {
+      let jsonStr = envValue;
+      
+      // Check if it's Base64 encoded (doesn't start with '[')
+      if (!jsonStr.trim().startsWith('[')) {
+        try {
+          jsonStr = Buffer.from(jsonStr, 'base64').toString('utf8');
+          log.info(`从 Base64 编码的 ${envVarName} 解码`);
+        } catch (decodeError) {
+          // Not base64, try as raw JSON
+        }
+      }
+      
+      const parsed = JSON.parse(jsonStr);
+      // Tag tokens with their source for logging
+      parsed.forEach(token => {
+        token._source = envVarName;
+      });
+      log.info(`从 ${envVarName} 加载了 ${parsed.length} 个token`);
+      return parsed;
+    } catch (parseError) {
+      log.error(`解析 ${envVarName} 环境变量失败:`, parseError.message);
+      return [];
+    }
   }
 
   loadTokens() {
@@ -31,42 +64,70 @@ class TokenManager {
 
       log.info('正在加载token...');
       
-      let tokenArray;
+      let tokenArray = [];
       
-      // Priority: ACCOUNTS_JSON env var > file
-      // Supports both raw JSON and Base64-encoded JSON
-      if (process.env.ACCOUNTS_JSON) {
-        try {
-          let jsonStr = process.env.ACCOUNTS_JSON;
-          
-          // Check if it's Base64 encoded (doesn't start with '[')
-          if (!jsonStr.trim().startsWith('[')) {
-            try {
-              jsonStr = Buffer.from(jsonStr, 'base64').toString('utf8');
-              log.info('从 Base64 编码的 ACCOUNTS_JSON 解码');
-            } catch (decodeError) {
-              // Not base64, try as raw JSON
-            }
-          }
-          
-          tokenArray = JSON.parse(jsonStr);
-          this.useEnvAccounts = true;
-          log.info('从环境变量 ACCOUNTS_JSON 加载token');
-        } catch (parseError) {
-          log.error('解析 ACCOUNTS_JSON 环境变量失败:', parseError.message);
-          tokenArray = [];
+      // Check for ACCOUNTS_JSON, ACCOUNTS_JSON_2 through ACCOUNTS_JSON_10
+      const envVarNames = [
+        'ACCOUNTS_JSON',
+        'ACCOUNTS_JSON_2',
+        'ACCOUNTS_JSON_3',
+        'ACCOUNTS_JSON_4',
+        'ACCOUNTS_JSON_5',
+        'ACCOUNTS_JSON_6',
+        'ACCOUNTS_JSON_7',
+        'ACCOUNTS_JSON_8',
+        'ACCOUNTS_JSON_9',
+        'ACCOUNTS_JSON_10'
+      ];
+      
+      let loadedFromEnv = false;
+      for (const envVarName of envVarNames) {
+        if (process.env[envVarName]) {
+          const tokens = this.parseAccountsEnvVar(envVarName);
+          tokenArray = tokenArray.concat(tokens);
+          loadedFromEnv = true;
         }
+      }
+      
+      if (loadedFromEnv) {
+        this.useEnvAccounts = true;
+        log.info(`从环境变量加载token完成，共 ${tokenArray.length} 个`);
       } else {
+        // Fallback to file
         const data = fs.readFileSync(this.filePath, 'utf8');
         tokenArray = JSON.parse(data);
         this.useEnvAccounts = false;
+        log.info('从文件加载token');
       }
       
       this.cachedData = tokenArray; // 缓存原始数据
-      this.tokens = tokenArray.filter(token => token.enable !== false);
-      this.currentIndex = 0;
+      
+      // Filter enabled tokens and check cooldowns
+      const now = Date.now();
+      this.tokens = tokenArray.filter(token => {
+        if (token.enable === false) return false;
+        
+        // Check if token is in cooldown
+        const cooldownUntil = this.tokenCooldowns.get(token.refresh_token);
+        if (cooldownUntil && now < cooldownUntil) {
+          const remainingSeconds = Math.ceil((cooldownUntil - now) / 1000);
+          log.info(`Token 仍在冷却中，剩余 ${remainingSeconds} 秒`);
+          return false;
+        } else if (cooldownUntil && now >= cooldownUntil) {
+          // Cooldown expired, re-enable token
+          this.tokenCooldowns.delete(token.refresh_token);
+          log.info(`Token 冷却结束，重新启用`);
+        }
+        return true;
+      });
+      
+      // Keep currentIndex in bounds
+      if (this.currentIndex >= this.tokens.length) {
+        this.currentIndex = 0;
+      }
+      
       this.lastLoadTime = Date.now();
-      log.info(`成功加载 ${this.tokens.length} 个可用token`);
+      log.info(`成功加载 ${this.tokens.length} 个可用token (共 ${tokenArray.length} 个)`);
 
       // 触发垃圾回收（如果可用）
       if (global.gc) {
@@ -76,6 +137,20 @@ class TokenManager {
       log.error('加载token失败:', error.message);
       this.tokens = [];
     }
+  }
+  
+  // Temporarily disable a token (rate limit/error) with cooldown
+  setCooldown(token, durationMs = this.cooldownDuration) {
+    const cooldownUntil = Date.now() + durationMs;
+    this.tokenCooldowns.set(token.refresh_token, cooldownUntil);
+    const source = token._source || 'file';
+    log.warn(`Token (来源: ${source}) 进入冷却期 ${durationMs / 1000} 秒`);
+  }
+  
+  // Force reload tokens (clears cache timer)
+  forceReload() {
+    this.lastLoadTime = 0;
+    this.loadTokens();
   }
 
   isExpired(token) {
@@ -152,36 +227,77 @@ class TokenManager {
   }
 
   async getToken() {
+    // Force reload to check cooldowns
+    this.lastLoadTime = 0;
     this.loadTokens();
-    if (this.tokens.length === 0) return null;
+    
+    if (this.tokens.length === 0) {
+      log.warn('没有可用token，检查是否所有token都在冷却中...');
+      // Check if we have tokens in cooldown that we can wait for
+      if (this.tokenCooldowns.size > 0) {
+        log.info(`${this.tokenCooldowns.size} 个token在冷却中，等待最近的一个...`);
+      }
+      return null;
+    }
 
-    for (let i = 0; i < this.tokens.length; i++) {
+    const startIndex = this.currentIndex;
+    let attempts = 0;
+    
+    while (attempts < this.tokens.length) {
       const token = this.tokens[this.currentIndex];
       const tokenIndex = this.currentIndex;
+      const source = token._source || 'file';
 
       try {
         if (this.isExpired(token)) {
           await this.refreshToken(token);
         }
+        
+        // Move to next token for round-robin
         this.currentIndex = (this.currentIndex + 1) % this.tokens.length;
 
         // 记录使用统计
         this.recordUsage(token);
-        log.info(`🔄 轮询使用 Token #${tokenIndex} (总请求: ${this.getTokenRequests(token)})`);
+        log.info(`🔄 轮询使用 Token #${tokenIndex} (来源: ${source}) (总请求: ${this.getTokenRequests(token)})`);
 
         return token;
       } catch (error) {
-        if (error.statusCode === 403) {
-          log.warn(`Token ${this.currentIndex} 刷新失败(403)，禁用并尝试下一个`);
-          this.disableToken(token);
+        const statusCode = error.statusCode || error.status;
+        
+        if (statusCode === 403) {
+          log.warn(`Token #${tokenIndex} (来源: ${source}) 遇到403错误，进入冷却期`);
+          this.setCooldown(token, this.cooldownDuration);
+        } else if (statusCode === 429) {
+          // Rate limited - longer cooldown
+          log.warn(`Token #${tokenIndex} (来源: ${source}) 遇到429限流，进入较长冷却期`);
+          this.setCooldown(token, this.cooldownDuration * 2); // 10 minutes for rate limit
         } else {
-          log.error(`Token ${this.currentIndex} 刷新失败:`, error.message);
+          log.error(`Token #${tokenIndex} (来源: ${source}) 错误:`, error.message);
+          // Short cooldown for other errors
+          this.setCooldown(token, 60 * 1000); // 1 minute
         }
+        
+        // Move to next token
         this.currentIndex = (this.currentIndex + 1) % this.tokens.length;
-        if (this.tokens.length === 0) return null;
+        attempts++;
+        
+        // Reload to exclude cooldown tokens
+        this.lastLoadTime = 0;
+        this.loadTokens();
+        
+        if (this.tokens.length === 0) {
+          log.error('所有token都在冷却中');
+          return null;
+        }
+        
+        // Adjust currentIndex if needed
+        if (this.currentIndex >= this.tokens.length) {
+          this.currentIndex = 0;
+        }
       }
     }
 
+    log.error('尝试所有token后仍失败');
     return null;
   }
 
@@ -230,26 +346,50 @@ class TokenManager {
   }
 
   async handleRequestError(error, currentAccessToken) {
-    if (error.statusCode === 403) {
-      log.warn('请求遇到403错误，尝试刷新token');
-      const currentToken = this.tokens[this.currentIndex];
-      if (currentToken && currentToken.access_token === currentAccessToken) {
-        try {
-          await this.refreshToken(currentToken);
-          log.info('Token刷新成功，返回新token');
-          return currentToken;
-        } catch (refreshError) {
-          if (refreshError.statusCode === 403) {
-            log.warn('刷新token也遇到403，禁用并切换到下一个');
-            this.disableToken(currentToken);
-            return await this.getToken();
-          }
-          log.error('刷新token失败:', refreshError.message);
-        }
+    const statusCode = error.statusCode || error.status;
+    
+    if (statusCode === 403 || statusCode === 429) {
+      const errorType = statusCode === 429 ? '429限流' : '403';
+      log.warn(`请求遇到${errorType}错误，尝试切换token`);
+      
+      // Find the token that was used
+      const usedToken = this.tokens.find(t => t.access_token === currentAccessToken);
+      if (usedToken) {
+        const cooldownTime = statusCode === 429 ? this.cooldownDuration * 2 : this.cooldownDuration;
+        this.setCooldown(usedToken, cooldownTime);
       }
+      
+      // Try to get a new token
       return await this.getToken();
     }
     return null;
+  }
+  
+  // Get status of all tokens including cooldowns
+  getTokenPoolStatus() {
+    const now = Date.now();
+    const allTokens = this.cachedData || [];
+    
+    return {
+      totalConfigured: allTokens.length,
+      available: this.tokens.length,
+      inCooldown: this.tokenCooldowns.size,
+      currentIndex: this.currentIndex,
+      tokens: allTokens.map((token, index) => {
+        const cooldownUntil = this.tokenCooldowns.get(token.refresh_token);
+        const usage = this.usageStats.get(token.refresh_token) || { requests: 0, lastUsed: null };
+        
+        return {
+          index,
+          source: token._source || 'file',
+          enabled: token.enable !== false,
+          inCooldown: cooldownUntil ? now < cooldownUntil : false,
+          cooldownRemaining: cooldownUntil ? Math.max(0, Math.ceil((cooldownUntil - now) / 1000)) : 0,
+          requests: usage.requests,
+          lastUsed: usage.lastUsed ? new Date(usage.lastUsed).toISOString() : null
+        };
+      })
+    };
   }
 }
 const tokenManager = new TokenManager();
